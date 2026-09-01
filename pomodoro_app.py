@@ -181,88 +181,6 @@ class RowFrame(ttk.Frame):
         self.note.insert(0, note)
 
 
-class TagSelect(ttk.Frame):
-    """多选标签下拉控件：点弹出复选框列表，勾选即写入（逗号分隔 StringVar）"""
-
-    def __init__(self, master, variable, get_options):
-        super().__init__(master)
-        self.variable = variable
-        self.get_options = get_options
-        self.popup = None
-        self.entry = ttk.Entry(self, textvariable=variable, state="readonly", width=30)
-        self.entry.pack(side="left", fill="x", expand=True)
-        self.entry.bind("<Button-1>", lambda e: self.toggle())
-        ttk.Button(self, text="▾", width=3, command=self.toggle).pack(side="left")
-
-    def toggle(self):
-        if self.popup and self.popup.winfo_exists():
-            self._close()
-            return
-        self._open_popup()
-
-    def _current(self):
-        return {t.strip() for t in self.variable.get().split(",") if t.strip()}
-
-    def _open_popup(self):
-        self.popup = tk.Toplevel(self)
-        self.popup.overrideredirect(True)
-        self.popup.attributes("-topmost", True)
-        self.update_idletasks()
-        x = self.winfo_rootx()
-        y = self.winfo_rooty() + self.winfo_height()
-        self.popup.geometry(f"+{x}+{y}")
-        self.popup.bind("<Escape>", lambda e: self._close())
-        self.popup.bind("<FocusOut>", lambda e: self._close())
-        self._render_popup()
-
-    def _render_popup(self):
-        for w in self.popup.winfo_children():
-            w.destroy()
-        frm = ttk.Frame(self.popup, padding=4)
-        frm.pack()
-        cur = self._current()
-        options = sorted(set(self.get_options()) | cur)
-        self._checks = {}
-        if options:
-            for t in options:
-                v = tk.BooleanVar(value=(t in cur))
-                self._checks[t] = v
-                ttk.Checkbutton(frm, text=t, variable=v,
-                                command=lambda tt=t: self._apply(tt)).pack(anchor="w")
-        else:
-            ttk.Label(frm, text="（暂无标签，可在下方新增）",
-                      foreground="#888").pack(anchor="w")
-        addfrm = ttk.Frame(frm)
-        addfrm.pack(fill="x", pady=(4, 0))
-        self.new_tag_var = tk.StringVar()
-        ttk.Entry(addfrm, textvariable=self.new_tag_var, width=14).pack(side="left")
-        ttk.Button(addfrm, text="新增", command=self._add_new).pack(side="left", padx=(4, 0))
-        ttk.Button(frm, text="完成", width=8, command=self._close).pack(pady=(4, 0))
-
-    def _apply(self, tag):
-        cur = self._current()
-        if self._checks[tag].get():
-            cur.add(tag)
-        else:
-            cur.discard(tag)
-        self.variable.set(", ".join(sorted(cur)))
-
-    def _add_new(self):
-        t = self.new_tag_var.get().strip()
-        if not t:
-            return
-        cur = self._current()
-        cur.add(t)
-        self.variable.set(", ".join(sorted(cur)))
-        self.new_tag_var.set("")
-        self._render_popup()  # 重建列表，让新标签以勾选状态出现
-
-    def _close(self):
-        if self.popup and self.popup.winfo_exists():
-            self.popup.destroy()
-        self.popup = None
-
-
 class ProjectTab(ttk.Frame):
     """项目管理 Tab：列表（可点列名排序）+ 详情，支持状态/tag/笔记，无删除"""
 
@@ -337,9 +255,10 @@ class ProjectTab(ttk.Frame):
         self.status_edit_var = tk.StringVar()
         ttk.Combobox(right, textvariable=self.status_edit_var, values=STATUSES,
                      width=28, state="readonly").pack(fill="x")
-        ttk.Label(right, text="标签（下拉勾选，逗号分隔）").pack(anchor="w", pady=(6, 0))
+        ttk.Label(right, text="标签（手动输入，逗号分隔；可下拉选已有）").pack(anchor="w", pady=(6, 0))
         self.tags_var = tk.StringVar()
-        self.tags_entry = TagSelect(right, self.tags_var, self._all_tags)
+        self.tags_entry = ttk.Combobox(right, textvariable=self.tags_var,
+                                        values=self._all_tags(), width=28)
         self.tags_entry.pack(fill="x")
         ttk.Label(right, text="笔记（保存后写入 projects/{id}_{名称}.md）").pack(anchor="w", pady=(6, 0))
         btns = ttk.Frame(right)
@@ -363,6 +282,7 @@ class ProjectTab(ttk.Frame):
         all_tags = self._all_tags()
         cur_tag = self.tag_var.get()
         self.tag_cb.config(values=["全部"] + all_tags)
+        self.tags_entry.config(values=all_tags)
         if cur_tag not in ["全部"] + all_tags:
             self.tag_var.set("全部")
         for i in self.tree.get_children():

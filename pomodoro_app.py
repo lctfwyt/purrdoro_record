@@ -181,6 +181,88 @@ class RowFrame(ttk.Frame):
         self.note.insert(0, note)
 
 
+class TagSelect(ttk.Frame):
+    """多选标签下拉控件：点弹出复选框列表，勾选即写入（逗号分隔 StringVar）"""
+
+    def __init__(self, master, variable, get_options):
+        super().__init__(master)
+        self.variable = variable
+        self.get_options = get_options
+        self.popup = None
+        self.entry = ttk.Entry(self, textvariable=variable, state="readonly", width=30)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Button-1>", lambda e: self.toggle())
+        ttk.Button(self, text="▾", width=3, command=self.toggle).pack(side="left")
+
+    def toggle(self):
+        if self.popup and self.popup.winfo_exists():
+            self._close()
+            return
+        self._open_popup()
+
+    def _current(self):
+        return {t.strip() for t in self.variable.get().split(",") if t.strip()}
+
+    def _open_popup(self):
+        self.popup = tk.Toplevel(self)
+        self.popup.overrideredirect(True)
+        self.popup.attributes("-topmost", True)
+        self.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        self.popup.geometry(f"+{x}+{y}")
+        self.popup.bind("<Escape>", lambda e: self._close())
+        self.popup.bind("<FocusOut>", lambda e: self._close())
+        self._render_popup()
+
+    def _render_popup(self):
+        for w in self.popup.winfo_children():
+            w.destroy()
+        frm = ttk.Frame(self.popup, padding=4)
+        frm.pack()
+        cur = self._current()
+        options = sorted(set(self.get_options()) | cur)
+        self._checks = {}
+        if options:
+            for t in options:
+                v = tk.BooleanVar(value=(t in cur))
+                self._checks[t] = v
+                ttk.Checkbutton(frm, text=t, variable=v,
+                                command=lambda tt=t: self._apply(tt)).pack(anchor="w")
+        else:
+            ttk.Label(frm, text="（暂无标签，可在下方新增）",
+                      foreground="#888").pack(anchor="w")
+        addfrm = ttk.Frame(frm)
+        addfrm.pack(fill="x", pady=(4, 0))
+        self.new_tag_var = tk.StringVar()
+        ttk.Entry(addfrm, textvariable=self.new_tag_var, width=14).pack(side="left")
+        ttk.Button(addfrm, text="新增", command=self._add_new).pack(side="left", padx=(4, 0))
+        ttk.Button(frm, text="完成", width=8, command=self._close).pack(pady=(4, 0))
+
+    def _apply(self, tag):
+        cur = self._current()
+        if self._checks[tag].get():
+            cur.add(tag)
+        else:
+            cur.discard(tag)
+        self.variable.set(", ".join(sorted(cur)))
+
+    def _add_new(self):
+        t = self.new_tag_var.get().strip()
+        if not t:
+            return
+        cur = self._current()
+        cur.add(t)
+        self.variable.set(", ".join(sorted(cur)))
+        self.new_tag_var.set("")
+        self._render_popup()  # 重建列表，让新标签以勾选状态出现
+
+    def _close(self):
+        if self.popup and self.popup.winfo_exists():
+            self.popup.destroy()
+        self.popup = None
+
+
 class ProjectTab(ttk.Frame):
     """项目管理 Tab：列表（可点列名排序）+ 详情，支持状态/tag/笔记，无删除"""
 
@@ -255,9 +337,9 @@ class ProjectTab(ttk.Frame):
         self.status_edit_var = tk.StringVar()
         ttk.Combobox(right, textvariable=self.status_edit_var, values=STATUSES,
                      width=28, state="readonly").pack(fill="x")
-        ttk.Label(right, text="标签（逗号分隔）").pack(anchor="w", pady=(6, 0))
+        ttk.Label(right, text="标签（下拉勾选，逗号分隔）").pack(anchor="w", pady=(6, 0))
         self.tags_var = tk.StringVar()
-        self.tags_entry = ttk.Combobox(right, textvariable=self.tags_var, width=30)
+        self.tags_entry = TagSelect(right, self.tags_var, self._all_tags)
         self.tags_entry.pack(fill="x")
         ttk.Label(right, text="笔记（保存后写入 projects/{id}_{名称}.md）").pack(anchor="w", pady=(6, 0))
         btns = ttk.Frame(right)
@@ -274,11 +356,13 @@ class ProjectTab(ttk.Frame):
         nvsb.pack(side="right", fill="y")
 
     # ---- 列表 ----
+    def _all_tags(self):
+        return [r[0] for r in self.conn.execute("SELECT name FROM tags ORDER BY name")]
+
     def refresh(self):
-        all_tags = [r[0] for r in self.conn.execute("SELECT name FROM tags ORDER BY name")]
+        all_tags = self._all_tags()
         cur_tag = self.tag_var.get()
         self.tag_cb.config(values=["全部"] + all_tags)
-        self.tags_entry.config(values=all_tags)
         if cur_tag not in ["全部"] + all_tags:
             self.tag_var.set("全部")
         for i in self.tree.get_children():
@@ -474,6 +558,153 @@ class ProjectTab(ttk.Frame):
             messagebox.showerror("错误", "无法打开目录")
 
 
+class HistoryTab(ttk.Frame):
+    """历史番茄 Tab：按项目回看历史记录，逐条编辑（项目/日期/数量/备注），无删除"""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.conn = app.conn
+        self.current_rid = None  # 当前选中记录 id
+        self._build_ui()
+        self.refresh()
+
+    # ---- UI ----
+    def _build_ui(self):
+        bar = ttk.Frame(self, padding=6)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="项目:").pack(side="left")
+        self.project_var = tk.StringVar()
+        self.proj_cb = ttk.Combobox(bar, textvariable=self.project_var,
+                                    width=20, state="readonly")
+        self.proj_cb.pack(side="left", padx=2)
+        self.proj_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Label(bar, text="点击行可编辑下方记录详情", foreground="#888").pack(side="right")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="both", expand=True)
+        self.tree = ttk.Treeview(left, columns=("date", "project", "pomodoros", "note"),
+                                 show="headings")
+        for c, t, w in (("date", "日期", 100), ("project", "项目", 140),
+                        ("pomodoros", "番茄数", 60), ("note", "备注", 200)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w")
+        vsb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select_record)
+
+        right = ttk.Frame(mid, padding=(10, 0, 0, 0))
+        right.pack(side="right", fill="y")
+        ttk.Label(right, text="日期").pack(anchor="w")
+        dfrm = ttk.Frame(right)
+        dfrm.pack(fill="x")
+        self.date_edit_var = tk.StringVar()
+        ttk.Entry(dfrm, textvariable=self.date_edit_var, width=24).pack(side="left")
+        ttk.Button(dfrm, text="📅 选择", width=8,
+                   command=lambda: CalendarDialog(
+                       self, self.date_edit_var.get() or date.today().isoformat(),
+                       self.date_edit_var.set)).pack(side="left", padx=2)
+        ttk.Label(right, text="项目").pack(anchor="w", pady=(6, 0))
+        self.proj_edit_var = tk.StringVar()
+        self.proj_edit_cb = ttk.Combobox(right, textvariable=self.proj_edit_var, width=30)
+        self.proj_edit_cb.pack(fill="x")
+        ttk.Label(right, text="番茄数").pack(anchor="w", pady=(6, 0))
+        self.pomo = ttk.Spinbox(right, from_=0, to=999, width=8)
+        self.pomo.set(0)
+        self.pomo.pack(fill="x")
+        ttk.Label(right, text="备注").pack(anchor="w", pady=(6, 0))
+        self.note_edit_var = tk.StringVar()
+        ttk.Entry(right, textvariable=self.note_edit_var, width=30).pack(fill="x")
+        btns = ttk.Frame(right)
+        btns.pack(side="bottom", fill="x", pady=(6, 0))
+        ttk.Button(btns, text="保存", command=self.save_record).pack(side="left")
+
+    # ---- 列表 ----
+    def all_projects(self):
+        return [r[0] for r in self.conn.execute(
+            "SELECT name FROM projects ORDER BY updated_at DESC, id DESC")]
+
+    def refresh(self):
+        projs = self.all_projects()
+        self.proj_cb.config(values=projs)
+        self.proj_edit_cb.config(values=projs)
+        cur = self.project_var.get()
+        if cur not in projs:
+            self.project_var.set(projs[0] if projs else "")
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        name = self.project_var.get()
+        if name:
+            for rid, dt, proj, pomo, note in self.conn.execute(
+                    "SELECT id, date, project, pomodoros, note FROM records"
+                    " WHERE project_id=(SELECT id FROM projects WHERE name=?)"
+                    " ORDER BY date DESC, id DESC", (name,)):
+                self.tree.insert("", "end", iid=str(rid),
+                                 values=(dt, proj, pomo, note))
+        self._clear_detail()
+
+    def _clear_detail(self):
+        self.current_rid = None
+        self.date_edit_var.set("")
+        self.proj_edit_var.set("")
+        self.pomo.set(0)
+        self.note_edit_var.set("")
+
+    def on_select_record(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        self.current_rid = int(sel[0])
+        row = self.conn.execute(
+            "SELECT date, project, pomodoros, note FROM records WHERE id=?",
+            (self.current_rid,)).fetchone()
+        if not row:
+            self._clear_detail()
+            return
+        self.date_edit_var.set(row[0])
+        self.proj_edit_var.set(row[1])
+        self.pomo.set(row[2])
+        self.note_edit_var.set(row[3])
+
+    # ---- 保存（无删除） ----
+    def save_record(self):
+        if self.current_rid is None:
+            messagebox.showerror("错误", "请先在左侧选择一条记录")
+            return
+        new_name = self.proj_edit_var.get().strip()
+        if not new_name:
+            messagebox.showerror("错误", "项目名称不能为空")
+            return
+        d = self.date_edit_var.get().strip()
+        try:
+            date.fromisoformat(d)
+        except ValueError:
+            messagebox.showerror("错误", "日期格式必须是 YYYY-MM-DD")
+            return
+        try:
+            pomo = int(self.pomo.get())
+        except ValueError:
+            messagebox.showerror("错误", "番茄数必须是整数")
+            return
+        if pomo < 0:
+            messagebox.showerror("错误", "番茄数不能为负数")
+            return
+        note = self.note_edit_var.get().strip()
+        pid = self.app.resolve_project_id(new_name)  # 改名/新建项目都同步 project_id 与名称快照
+        self.conn.execute(
+            "UPDATE records SET date=?, project_id=?, project=?, pomodoros=?, note=? WHERE id=?",
+            (d, pid, new_name, pomo, note, self.current_rid))
+        self.conn.commit()
+        self.refresh()
+        self.app.project_tab.refresh()
+        self.app.refresh_project_values()
+        messagebox.showinfo("成功", "已保存")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -544,12 +775,24 @@ class App(tk.Tk):
         self.project_tab = ProjectTab(tab2, self)
         self.project_tab.pack(fill="both", expand=True)
 
+        # ============ Tab3 历史番茄 ============
+        tab3 = ttk.Frame(self.nb)
+        self.nb.add(tab3, text="历史番茄")
+        self.history_tab = HistoryTab(tab3, self)
+        self.history_tab.pack(fill="both", expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # 窗口真正渲染后再按所需高度调整，保证项目管理 tab 底部按钮完全可见
         self.after(80, self._fit_window_height)
 
     def _fit_window_height(self):
         self.update_idletasks()
         self.geometry(f"1000x{max(400, self.nb.winfo_reqheight() + 45)}")
+
+    def _on_tab_changed(self, _event=None):
+        # 切到历史番茄时刷新，保证看到最新数据（每日提交/项目改名后）
+        if self.nb.index(self.nb.select()) == 2:
+            self.history_tab.refresh()
 
     # ---- 行管理 ----
     def get_projects(self):

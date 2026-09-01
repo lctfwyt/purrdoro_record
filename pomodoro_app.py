@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """番茄钟工作学习记录 - 单文件桌面应用 (tkinter + sqlite3)
 
-两个 Tab：
+三个 Tab：
   - 番茄记录：按日期记录项目番茄数
   - 项目管理：项目生命周期（计划中/进行中/已完成/已归档）、tag 分组、笔记(md)
+  - 历史番茄：按项目/tag 回看历史记录，逐条编辑（项目/日期/数量/备注）
 """
 import calendar
 import csv
@@ -225,6 +226,7 @@ class ProjectTab(ttk.Frame):
         self.tag_cb.pack(side="left", padx=2)
         self.tag_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         ttk.Button(bar, text="+ 新建项目", command=self.new_project).pack(side="left", padx=(10, 0))
+        ttk.Button(bar, text="删除无项目 tag", command=self.delete_orphan_tags).pack(side="left", padx=(4, 0))
         ttk.Label(bar, text="点击列名排序：降序→升序→原样",
                   foreground="#888").pack(side="right")
 
@@ -470,6 +472,22 @@ class ProjectTab(ttk.Frame):
         self.status_edit_var.set("已归档")
         self.save_project()
 
+    def delete_orphan_tags(self):
+        """删除无项目关联的 tag（输错后遗留的孤儿 tag）"""
+        ids = [r[0] for r in self.conn.execute(
+            "SELECT id FROM tags WHERE id NOT IN (SELECT tag_id FROM project_tags)")]
+        if not ids:
+            messagebox.showinfo("提示", "没有无项目的 tag")
+            return
+        if not messagebox.askyesno("确认", f"将删除 {len(ids)} 个无项目的 tag（不涉及任何项目/记录）："):
+            return
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM tags WHERE id IN ({placeholders})", ids)
+        self.conn.commit()
+        self.refresh()
+        self.app.history_tab.refresh()
+        messagebox.showinfo("成功", f"已删除 {len(ids)} 个无项目的 tag")
+
     def open_dir(self):
         os.makedirs(PROJECTS_DIR, exist_ok=True)
         try:
@@ -494,12 +512,19 @@ class HistoryTab(ttk.Frame):
         bar = ttk.Frame(self, padding=6)
         bar.pack(fill="x")
         ttk.Label(bar, text="项目:").pack(side="left")
-        self.project_var = tk.StringVar()
-        self.proj_cb = ttk.Combobox(bar, textvariable=self.project_var,
-                                    width=20, state="readonly")
+        self.project_var = tk.StringVar(value="全部项目")
+        self.proj_cb = ttk.Combobox(bar, textvariable=self.project_var, width=18)
         self.proj_cb.pack(side="left", padx=2)
         self.proj_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
-        ttk.Label(bar, text="点击行可编辑下方记录详情", foreground="#888").pack(side="right")
+        ttk.Label(bar, text="标签:").pack(side="left", padx=(10, 0))
+        self.tag_var = tk.StringVar(value="全部")
+        self.tag_cb = ttk.Combobox(bar, textvariable=self.tag_var, width=10)
+        self.tag_cb.pack(side="left", padx=2)
+        self.tag_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Label(bar, text="输入可筛选下拉，点选或回车生效",
+                  foreground="#888").pack(side="right")
+        self._narrow_dropdown(self.proj_cb, self.project_var, "全部项目", self.all_projects)
+        self._narrow_dropdown(self.tag_cb, self.tag_var, "全部", self._all_tags)
 
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -548,23 +573,42 @@ class HistoryTab(ttk.Frame):
         return [r[0] for r in self.conn.execute(
             "SELECT name FROM projects ORDER BY updated_at DESC, id DESC")]
 
+    def _all_tags(self):
+        return [r[0] for r in self.conn.execute("SELECT name FROM tags ORDER BY name")]
+
+    def _narrow_dropdown(self, cb, var, sentinel, items_getter):
+        """输入时按关键字过滤下拉选项；下拉点选或回车提交筛选（非法输入回车后归回 sentinel）"""
+        def on_keyrelease(_e):
+            kw = var.get().strip()
+            cb.config(values=[sentinel] + [s for s in items_getter() if kw in s])
+        cb.bind("<KeyRelease>", on_keyrelease)
+        cb.bind("<Return>", lambda e: self.refresh())
+
     def refresh(self):
         projs = self.all_projects()
-        self.proj_cb.config(values=projs)
-        self.proj_edit_cb.config(values=projs)
-        cur = self.project_var.get()
-        if cur not in projs:
-            self.project_var.set(projs[0] if projs else "")
+        tags = self._all_tags()
+        self.proj_cb.config(values=["全部项目"] + projs)
+        self.tag_cb.config(values=["全部"] + tags)
+        self.proj_edit_cb.config(values=projs)  # 编辑面板项目下拉不变（全部项目，可手输）
+        if self.project_var.get() not in ["全部项目"] + projs:
+            self.project_var.set("全部项目")
+        if self.tag_var.get() not in ["全部"] + tags:
+            self.tag_var.set("全部")
         for i in self.tree.get_children():
             self.tree.delete(i)
-        name = self.project_var.get()
-        if name:
-            for rid, dt, proj, pomo, note in self.conn.execute(
-                    "SELECT id, date, project, pomodoros, note FROM records"
-                    " WHERE project_id=(SELECT id FROM projects WHERE name=?)"
-                    " ORDER BY date DESC, id DESC", (name,)):
-                self.tree.insert("", "end", iid=str(rid),
-                                 values=(dt, proj, pomo, note))
+        sql = ("SELECT r.id, r.date, r.project, r.pomodoros, r.note"
+               " FROM records r JOIN projects p ON p.id = r.project_id WHERE 1=1")
+        params = []
+        if self.project_var.get() != "全部项目":
+            sql += " AND p.name = ?"
+            params.append(self.project_var.get())
+        if self.tag_var.get() != "全部":
+            sql += (" AND r.project_id IN (SELECT pt.project_id FROM project_tags pt"
+                    " JOIN tags t ON t.id=pt.tag_id WHERE t.name = ?)")
+            params.append(self.tag_var.get())
+        sql += " ORDER BY r.date DESC, r.id DESC"
+        for rid, dt, proj, pomo, note in self.conn.execute(sql, params):
+            self.tree.insert("", "end", iid=str(rid), values=(dt, proj, pomo, note))
         self._clear_detail()
 
     def _clear_detail(self):

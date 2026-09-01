@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""番茄钟工作学习记录 - 单文件桌面应用 (tkinter + sqlite3)"""
+"""番茄钟工作学习记录 - 单文件桌面应用 (tkinter + sqlite3)
+
+两个 Tab：
+  - 番茄记录：按日期记录项目番茄数
+  - 项目管理：项目生命周期（计划中/进行中/已完成/已归档）、tag 分组、笔记(md)
+"""
 import calendar
 import csv
 import os
@@ -7,14 +12,28 @@ import sqlite3
 import sys
 import tkinter as tk
 from datetime import date
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
-# 打包成 exe 后 __file__ 指向临时解压目录，数据库要放在 exe 同级目录
+# 打包成 exe 后 __file__ 指向临时解压目录，数据要放在 exe 同级目录
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "pomodoro.db")
+PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
+
+STATUSES = ("计划中", "进行中", "已完成", "已归档")
+
+
+def sanitize_filename(name):
+    for ch in '\\/:*?"<>|':
+        name = name.replace(ch, "_")
+    return name.strip() or "untitled"
+
+
+def note_template(name):
+    """带章节头的 md 模板（仅内存中，第一次保存才写入磁盘）"""
+    return f"# {name}\n\n## 为什么想做\n\n\n## 学习资料\n\n\n## idea 与规划\n\n"
 
 
 def get_conn():
@@ -23,10 +42,43 @@ def get_conn():
         """CREATE TABLE IF NOT EXISTS records(
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                date TEXT NOT NULL,
-               project TEXT NOT NULL,
+               project TEXT NOT NULL DEFAULT '',
+               project_id INTEGER,
                pomodoros INTEGER NOT NULL DEFAULT 0,
                note TEXT NOT NULL DEFAULT '')"""
     )
+    # ---- 项目 / 标签 ----
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS tags(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT UNIQUE NOT NULL)"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS projects(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT UNIQUE NOT NULL,
+               status TEXT NOT NULL DEFAULT '进行中',
+               created_at TEXT, updated_at TEXT)"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS project_tags(
+               project_id INTEGER NOT NULL,
+               tag_id INTEGER NOT NULL,
+               PRIMARY KEY(project_id, tag_id))"""
+    )
+    # ---- 迁移：records 加 project_id ----
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
+    if "project_id" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN project_id INTEGER")
+    # ---- 回填：旧记录的项目名 → 自动建项目并关联 ----
+    conn.execute(
+        """INSERT OR IGNORE INTO projects(name, status, created_at, updated_at)
+           SELECT DISTINCT project, '进行中', date('now'), date('now')
+           FROM records WHERE project <> ''""")
+    conn.execute(
+        """UPDATE records SET project_id = (SELECT id FROM projects
+           WHERE projects.name = records.project)
+           WHERE project_id IS NULL AND project <> ''""")
     conn.commit()
     return conn
 
@@ -129,11 +181,304 @@ class RowFrame(ttk.Frame):
         self.note.insert(0, note)
 
 
+class ProjectTab(ttk.Frame):
+    """项目管理 Tab：列表（可点列名排序）+ 详情，支持状态/tag/笔记，无删除"""
+
+    SORTABLE = {
+        "name": "p.name",
+        "status": "p.status",
+        "tags": "tags",
+        "pomo": "pomo",
+        "first": "first_date",
+        "last": "last_date",
+    }
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.conn = app.conn
+        self.current_pid = None
+        self.sort_key = None   # 当前排序列，None = 默认排序
+        self.sort_dir = None   # ASC / DESC
+        self.note_baseline = ""  # 加载项目时的笔记内容，用于判断笔记是否被编辑
+        self._build_ui()
+        self.refresh()
+
+    # ---- UI ----
+    def _build_ui(self):
+        bar = ttk.Frame(self, padding=6)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="搜索:").pack(side="left")
+        self.search_var = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.search_var, width=16).pack(side="left", padx=2)
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Label(bar, text="状态:").pack(side="left", padx=(10, 0))
+        self.status_var = tk.StringVar(value="全部")
+        cb = ttk.Combobox(bar, textvariable=self.status_var, values=("全部",) + STATUSES,
+                          width=8, state="readonly")
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Label(bar, text="标签:").pack(side="left", padx=(10, 0))
+        self.tag_var = tk.StringVar(value="全部")
+        self.tag_cb = ttk.Combobox(bar, textvariable=self.tag_var, width=10,
+                                   state="readonly")
+        self.tag_cb.pack(side="left", padx=2)
+        self.tag_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Button(bar, text="+ 新建项目", command=self.new_project).pack(side="left", padx=(10, 0))
+        ttk.Label(bar, text="点击列名排序：降序→升序→原样",
+                  foreground="#888").pack(side="right")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="both", expand=True)
+        self.tree = ttk.Treeview(left,
+                                 columns=("name", "status", "tags", "pomo", "first", "last"),
+                                 show="headings")
+        for c, t, w in (("name", "名称", 150), ("status", "状态", 64),
+                        ("tags", "标签", 110), ("pomo", "番茄", 52),
+                        ("first", "首次登记", 90), ("last", "最近登记", 90)):
+            self.tree.heading(c, text=t, command=lambda col=c: self.on_sort(col))
+            self.tree.column(c, width=w, anchor="w")
+        vsb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+        right = ttk.Frame(mid, padding=(10, 0, 0, 0))
+        right.pack(side="right", fill="y")
+        ttk.Label(right, text="项目名称").pack(anchor="w")
+        self.name_var = tk.StringVar()
+        ttk.Entry(right, textvariable=self.name_var, width=30).pack(fill="x")
+        ttk.Label(right, text="状态").pack(anchor="w", pady=(6, 0))
+        self.status_edit_var = tk.StringVar()
+        ttk.Combobox(right, textvariable=self.status_edit_var, values=STATUSES,
+                     width=28, state="readonly").pack(fill="x")
+        ttk.Label(right, text="标签（逗号分隔）").pack(anchor="w", pady=(6, 0))
+        self.tags_var = tk.StringVar()
+        self.tags_entry = ttk.Combobox(right, textvariable=self.tags_var, width=30)
+        self.tags_entry.pack(fill="x")
+        ttk.Label(right, text="笔记（保存后写入 projects/{id}_{名称}.md）").pack(anchor="w", pady=(6, 0))
+        btns = ttk.Frame(right)
+        btns.pack(side="bottom", fill="x", pady=(6, 0))
+        ttk.Button(btns, text="保存", command=self.save_project).pack(side="left")
+        ttk.Button(btns, text="归档", command=self.archive_project).pack(side="left", padx=4)
+        ttk.Button(btns, text="打开目录", command=self.open_dir).pack(side="right")
+        nwrap = ttk.Frame(right)
+        nwrap.pack(fill="both", expand=True)
+        self.note = tk.Text(nwrap, width=46, height=9, wrap="word")
+        nvsb = ttk.Scrollbar(nwrap, orient="vertical", command=self.note.yview)
+        self.note.configure(yscrollcommand=nvsb.set)
+        self.note.pack(side="left", fill="both", expand=True)
+        nvsb.pack(side="right", fill="y")
+
+    # ---- 列表 ----
+    def refresh(self):
+        all_tags = [r[0] for r in self.conn.execute("SELECT name FROM tags ORDER BY name")]
+        cur_tag = self.tag_var.get()
+        self.tag_cb.config(values=["全部"] + all_tags)
+        self.tags_entry.config(values=all_tags)
+        if cur_tag not in ["全部"] + all_tags:
+            self.tag_var.set("全部")
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        sql = """SELECT p.id, p.name, p.status,
+                        (SELECT GROUP_CONCAT(t.name, ', ') FROM project_tags pt
+                         JOIN tags t ON t.id = pt.tag_id WHERE pt.project_id = p.id) AS tags,
+                        (SELECT COALESCE(SUM(r.pomodoros),0) FROM records r
+                         WHERE r.project_id = p.id) AS pomo,
+                        (SELECT MIN(r.date) FROM records r WHERE r.project_id = p.id) AS first_date,
+                        (SELECT MAX(r.date) FROM records r WHERE r.project_id = p.id) AS last_date
+                 FROM projects p WHERE 1=1"""
+        params = []
+        kw = self.search_var.get().strip()
+        if kw:
+            sql += " AND p.name LIKE ?"
+            params.append(f"%{kw}%")
+        st = self.status_var.get()
+        if st != "全部":
+            sql += " AND p.status = ?"
+            params.append(st)
+        tg = self.tag_var.get()
+        if tg != "全部":
+            sql += (" AND p.id IN (SELECT pt.project_id FROM project_tags pt"
+                    " JOIN tags t ON t.id = pt.tag_id WHERE t.name = ?)")
+            params.append(tg)
+        if self.sort_key in self.SORTABLE:
+            sql += f" ORDER BY {self.SORTABLE[self.sort_key]} {self.sort_dir}, p.id"
+        else:
+            sql += " ORDER BY p.updated_at DESC, p.id DESC"
+        for pid, name, status, tags, pomo, first, last in self.conn.execute(sql, params):
+            self.tree.insert("", "end", iid=str(pid),
+                             values=(name, status, tags or "", pomo,
+                                     (first or "")[:10], (last or "")[:10]))
+
+    def on_sort(self, col):
+        """点击列名：循环 降序 → 升序 → 恢复原样"""
+        if self.sort_key != col:
+            self.sort_key, self.sort_dir = col, "DESC"
+        elif self.sort_dir == "DESC":
+            self.sort_dir = "ASC"
+        else:
+            self.sort_key, self.sort_dir = None, None
+        self.refresh()
+
+    # ---- 笔记文件（懒创建，命名 {id}_{名称}.md） ----
+    def note_path(self, pid, name):
+        return os.path.join(PROJECTS_DIR, f"{pid}_{sanitize_filename(name)}.md")
+
+    def find_note_file(self, pid, name):
+        """优先新命名，其次兼容旧版 {id}.md / 改名前的 {id}_{旧名}.md"""
+        newp = self.note_path(pid, name)
+        if os.path.exists(newp):
+            return newp
+        if not os.path.isdir(PROJECTS_DIR):
+            return None
+        for fn in os.listdir(PROJECTS_DIR):
+            if fn == f"{pid}.md" or (fn.startswith(f"{pid}_") and fn.endswith(".md")):
+                return os.path.join(PROJECTS_DIR, fn)
+        return None
+
+    def save_note(self, pid, name, content, changed, old_name=None):
+        existing = self.find_note_file(pid, name)
+        target = self.note_path(pid, name)
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        if not changed:
+            # 笔记未编辑：不创建/修改文件；仅当项目改名且已有文件时重命名（含旧版 {id}.md 迁移）
+            if existing and os.path.abspath(existing) != os.path.abspath(target):
+                self._rename_note_file(existing, target, old_name or name, name)
+            return
+        if content.strip():
+            if existing and os.path.abspath(existing) != os.path.abspath(target):
+                try:
+                    os.remove(existing)
+                except OSError:
+                    pass
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+        elif existing:
+            try:
+                os.remove(existing)  # 内容清空则删除文件，保持目录干净
+            except OSError:
+                pass
+
+    def _rename_note_file(self, existing, target, old_name, new_name):
+        try:
+            if old_name != new_name:
+                with open(existing, encoding="utf-8") as f:
+                    lines = f.readlines()
+                if lines and lines[0].strip() == f"# {old_name}":
+                    lines[0] = f"# {new_name}\n"
+                    with open(existing, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+            os.replace(existing, target)
+        except OSError:
+            pass
+
+    def on_select(self, _event=None):
+        sel = self.tree.selection()
+        if sel:
+            self.load_project(int(sel[0]))
+
+    def load_project(self, pid):
+        row = self.conn.execute("SELECT name, status FROM projects WHERE id=?", (pid,)).fetchone()
+        if not row:
+            return
+        name, status = row
+        self.current_pid = pid
+        self.name_var.set(name)
+        self.status_edit_var.set(status)
+        tags = [r[0] for r in self.conn.execute(
+            "SELECT t.name FROM tags t JOIN project_tags pt ON t.id=pt.tag_id"
+            " WHERE pt.project_id=? ORDER BY t.name", (pid,))]
+        self.tags_var.set(", ".join(tags))
+        self.note.delete("1.0", tk.END)
+        f = self.find_note_file(pid, name)
+        if f:
+            with open(f, encoding="utf-8") as fh:
+                self.note.insert("1.0", fh.read())
+        else:
+            self.note.insert("1.0", note_template(name))
+        self.note_baseline = self.note.get("1.0", "end-1c")
+
+    # ---- 新建 / 保存 / 归档 ----
+    def new_project(self):
+        name = simpledialog.askstring("新建项目", "项目名称：", parent=self)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self.conn.execute("SELECT 1 FROM projects WHERE name=?", (name,)).fetchone():
+            messagebox.showerror("错误", f"项目名「{name}」已存在")
+            return
+        now = date.today().isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO projects(name, status, created_at, updated_at) VALUES(?,?,?,?)",
+            (name, "计划中", now, now))
+        pid = cur.lastrowid
+        self.conn.commit()
+        self.refresh()
+        self.tree.selection_set(str(pid))
+        self.tree.see(str(pid))
+        self.load_project(pid)
+        self.app.refresh_project_values()
+
+    def save_project(self):
+        if self.current_pid is None:
+            return
+        pid = self.current_pid
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror("错误", "项目名称不能为空")
+            return
+        if self.conn.execute("SELECT 1 FROM projects WHERE name=? AND id<>?",
+                             (name, pid)).fetchone():
+            messagebox.showerror("错误", f"项目名「{name}」已存在")
+            return
+        old_name = self.conn.execute("SELECT name FROM projects WHERE id=?", (pid,)).fetchone()[0]
+        status = self.status_edit_var.get() or "进行中"
+        now = date.today().isoformat()
+        self.conn.execute("UPDATE projects SET name=?, status=?, updated_at=? WHERE id=?",
+                          (name, status, now, pid))
+        if name != old_name:
+            self.conn.execute("UPDATE records SET project=? WHERE project_id=?", (name, pid))
+        # tags：整组替换（合并/拆分 = 增删 tag 关联，完全可逆）
+        self.conn.execute("DELETE FROM project_tags WHERE project_id=?", (pid,))
+        for t in [x.strip() for x in self.tags_var.get().split(",") if x.strip()]:
+            self.conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (t,))
+            tid = self.conn.execute("SELECT id FROM tags WHERE name=?", (t,)).fetchone()[0]
+            self.conn.execute("INSERT OR IGNORE INTO project_tags(project_id, tag_id) VALUES(?,?)",
+                              (pid, tid))
+        # 笔记：只有编辑过才写/删文件；仅改名时把已有文件重命名
+        note = self.note.get("1.0", "end-1c")
+        self.save_note(pid, name, note, note != self.note_baseline, old_name)
+        self.note_baseline = note
+        self.conn.commit()
+        self.refresh()
+        self.app.refresh_project_values()
+        messagebox.showinfo("成功", "已保存")
+
+    def archive_project(self):
+        if self.current_pid is None:
+            return
+        self.status_edit_var.set("已归档")
+        self.save_project()
+
+    def open_dir(self):
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        try:
+            os.startfile(PROJECTS_DIR)
+        except OSError:
+            messagebox.showerror("错误", "无法打开目录")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("番茄钟记录")
-        self.geometry("780x560")
+        self.geometry("1000x400")
         self.conn = get_conn()
         self.rows = []
         self.saved_snapshot = []  # 上次加载/提交的内容快照，用于脏检测
@@ -141,8 +486,15 @@ class App(tk.Tk):
         self.load_date()
 
     def _build_ui(self):
-        # ---- 顶部：日期选择 ----
-        top = ttk.Frame(self, padding=6)
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True)
+
+        # ============ Tab1 番茄记录 ============
+        tab1 = ttk.Frame(self.nb)
+        self.nb.add(tab1, text="番茄记录")
+
+        # 顶部：日期选择
+        top = ttk.Frame(tab1, padding=6)
         top.pack(fill="x")
         ttk.Label(top, text="日期:").pack(side="left")
         ttk.Button(top, text="‹", width=3, command=lambda: self.shift_day(-1)).pack(side="left")
@@ -159,15 +511,15 @@ class App(tk.Tk):
         ttk.Button(top, text="导入CSV", command=self.import_csv).pack(side="right", padx=2)
         ttk.Button(top, text="导出CSV", command=self.export_csv).pack(side="right", padx=2)
 
-        # ---- 表头 ----
-        head = ttk.Frame(self, padding=(8, 0))
+        # 表头
+        head = ttk.Frame(tab1, padding=(8, 0))
         head.pack(fill="x")
         ttk.Label(head, text="项目名称", width=26, anchor="w").grid(row=0, column=0, padx=2)
         ttk.Label(head, text="番茄数", width=6, anchor="w").grid(row=0, column=1, padx=2)
         ttk.Label(head, text="备注", anchor="w").grid(row=0, column=2, padx=2)
 
-        # ---- 可滚动行容器 ----
-        wrap = ttk.Frame(self)
+        # 可滚动行容器
+        wrap = ttk.Frame(tab1)
         wrap.pack(fill="both", expand=True, padx=6)
         canvas = tk.Canvas(wrap, highlightthickness=0)
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
@@ -180,21 +532,47 @@ class App(tk.Tk):
                             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         self.canvas = canvas
 
-        # ---- 底部按钮 ----
-        bottom = ttk.Frame(self, padding=6)
+        # 底部按钮
+        bottom = ttk.Frame(tab1, padding=6)
         bottom.pack(fill="x")
         ttk.Button(bottom, text="+ 添加行", command=lambda: self.add_row()).pack(side="left")
         ttk.Button(bottom, text="提交保存", command=self.submit).pack(side="right")
 
+        # ============ Tab2 项目管理 ============
+        tab2 = ttk.Frame(self.nb)
+        self.nb.add(tab2, text="项目管理")
+        self.project_tab = ProjectTab(tab2, self)
+        self.project_tab.pack(fill="both", expand=True)
+
+        # 窗口真正渲染后再按所需高度调整，保证项目管理 tab 底部按钮完全可见
+        self.after(80, self._fit_window_height)
+
+    def _fit_window_height(self):
+        self.update_idletasks()
+        self.geometry(f"1000x{max(400, self.nb.winfo_reqheight() + 45)}")
+
     # ---- 行管理 ----
     def get_projects(self):
-        cur = self.conn.execute("SELECT DISTINCT project FROM records ORDER BY project")
+        """番茄下拉只显示进行中的项目"""
+        cur = self.conn.execute(
+            "SELECT name FROM projects WHERE status='进行中' ORDER BY name")
         return [r[0] for r in cur.fetchall()]
 
     def refresh_project_values(self):
         projects = self.get_projects()
         for r in self.rows:
             r.project.config(values=projects)
+
+    def resolve_project_id(self, name):
+        """按名称找项目，找不到则自动新建为「进行中」项目（笔记懒创建，不落盘）"""
+        row = self.conn.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()
+        if row:
+            return row[0]
+        now = date.today().isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO projects(name, status, created_at, updated_at) VALUES(?,?,?,?)",
+            (name, "进行中", now, now))
+        return cur.lastrowid
 
     def add_row(self, project="", pomodoros=0, note=""):
         r = RowFrame(self.rows_area, self.delete_row, self.refresh_total,
@@ -323,13 +701,19 @@ class App(tk.Tk):
                 messagebox.showerror("错误", "存在备注但项目名称为空的行")
                 return False
             entries.append((d, proj, pomo, note))
+        rows = []
+        for d2, proj, pomo, note in entries:
+            pid = self.resolve_project_id(proj)
+            rows.append((d2, pid, proj, pomo, note))
         self.conn.execute("DELETE FROM records WHERE date=?", (d,))
         self.conn.executemany(
-            "INSERT INTO records(date, project, pomodoros, note) VALUES(?,?,?,?)", entries)
+            "INSERT INTO records(date, project_id, project, pomodoros, note) VALUES(?,?,?,?,?)",
+            rows)
         self.conn.commit()
         self.saved_snapshot = self.current_entries()
         self.refresh_total()
         self.refresh_project_values()  # 新项目名加入下拉
+        self.project_tab.refresh()     # 累计番茄/列表刷新
         if not quiet:
             messagebox.showinfo("成功", f"已保存 {d} 的 {len(entries)} 条记录")
         return True
@@ -365,15 +749,18 @@ class App(tk.Tk):
                     date.fromisoformat(d)  # 校验
                     if not proj:
                         raise ValueError(f"第{i}行 project 为空")
-                    rows.append((d, proj, int(float(pomo)), note))
+                    pid = self.resolve_project_id(proj)
+                    rows.append((d, pid, proj, int(float(pomo)), note))
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
             return
         self.conn.executemany(
-            "INSERT INTO records(date, project, pomodoros, note) VALUES(?,?,?,?)", rows)
+            "INSERT INTO records(date, project_id, project, pomodoros, note) VALUES(?,?,?,?,?)",
+            rows)
         self.conn.commit()
         messagebox.showinfo("成功", f"已导入 {len(rows)} 条记录")
         self.load_date()
+        self.project_tab.refresh()
 
     def destroy(self):
         self.conn.close()

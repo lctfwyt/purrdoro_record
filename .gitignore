@@ -1,5 +1,7 @@
 /.idea/
+/__pycache__/
 /build/
+/dist/projects/
 /dist/pomodoro.db
 /pomodoro_app.spec
 /打包备忘.md

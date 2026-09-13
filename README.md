@@ -8,13 +8,16 @@
 
 ## 点击下载
 
-点击下载并解压：
+点击下载并解压（三选一）：
 - 网盘：https://pan.baidu.com/s/1tXJQvxMCSu0zGLx30Wz0EA?pwd=at5w
 - Gitee：https://gitee.com/lctfwyt/purrdoro_record/releases/download/v1.0.0/purrdoro_record.zip
 - GitHub：https://github.com/lctfwyt/purrdoro_record/releases/download/v1.0.0/purrdoro_record.zip
 
 文件说明：
 - pomodoro_app.exe：双击打开应用
+
+（首次打开可能会触发弹窗“Microsoft Defender SmartScreen 阻止了无法识别的应用启动。”请点击“更多信息”，再点击“仍要运行”，即可正常使用。）
+
 - pomodoro.db：使用后自动生成，储存番茄记录和项目数据
 - projects文件夹：使用后自动生成，储存项目笔记
 

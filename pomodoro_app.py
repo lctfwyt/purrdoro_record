@@ -10,6 +10,7 @@ import calendar
 import csv
 import os
 import sqlite3
+import subprocess
 import sys
 import tkinter as tk
 from datetime import date
@@ -28,6 +29,7 @@ RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 ICON_PATH = os.path.join(RESOURCE_DIR, "record.ico")
 
 STATUSES = ("计划中", "进行中", "已完成", "已归档")
+SHORTCUT_NAME = "猫猫番茄记录"
 
 
 def sanitize_filename(name):
@@ -525,8 +527,12 @@ class HistoryTab(ttk.Frame):
         self.tag_cb = ttk.Combobox(bar, textvariable=self.tag_var, width=10)
         self.tag_cb.pack(side="left", padx=2)
         self.tag_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Button(bar, text="导入CSV",
+                   command=self.app.import_csv).pack(side="right", padx=2)
+        ttk.Button(bar, text="导出CSV",
+                   command=self.app.export_csv).pack(side="right", padx=2)
         ttk.Label(bar, text="输入可筛选下拉，点选或回车生效",
-                  foreground="#888").pack(side="right")
+                  foreground="#888").pack(side="right", padx=(0, 8))
         self._narrow_dropdown(self.proj_cb, self.project_var, "全部项目", self.all_projects)
         self._narrow_dropdown(self.tag_cb, self.tag_var, "全部", self._all_tags)
 
@@ -711,8 +717,8 @@ class App(tk.Tk):
         self.total_var = tk.StringVar(value="当日番茄总数: 0")
         ttk.Label(top, textvariable=self.total_var,
                   font=("", 10, "bold")).pack(side="left", padx=16)
-        ttk.Button(top, text="导入CSV", command=self.import_csv).pack(side="right", padx=2)
-        ttk.Button(top, text="导出CSV", command=self.export_csv).pack(side="right", padx=2)
+        ttk.Button(top, text="添加桌面快捷方式",
+                   command=self.create_desktop_shortcut).pack(side="right", padx=2)
 
         # 表头
         head = ttk.Frame(tab1, padding=(8, 0))
@@ -976,6 +982,54 @@ class App(tk.Tk):
         messagebox.showinfo("成功", f"已导入 {len(rows)} 条记录")
         self.load_date()
         self.project_tab.refresh()
+        self.history_tab.refresh()
+
+    # ---- 桌面快捷方式 ----
+    def create_desktop_shortcut(self):
+        """在桌面创建指向本应用的快捷方式（借 PowerShell 的 WScript.Shell，无第三方依赖）"""
+        if getattr(sys, "frozen", False):
+            target = sys.executable
+            workdir = os.path.dirname(sys.executable)
+            arguments = ""
+            icon = f"{sys.executable},0"
+        else:
+            script = os.path.abspath(__file__)
+            workdir = os.path.dirname(script)
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            target = pythonw if os.path.exists(pythonw) else sys.executable
+            arguments = f'"{script}"'
+            icon = ICON_PATH
+
+        # 路径一律经环境变量传入，不拼进命令串，避免引号/空格/注入问题
+        env = os.environ.copy()
+        env["POMO_LINK_NAME"] = SHORTCUT_NAME + ".lnk"
+        env["POMO_TARGET"] = target
+        env["POMO_WORKDIR"] = workdir
+        env["POMO_ARGS"] = arguments
+        env["POMO_ICON"] = icon
+        ps = (
+            "$desktop = [Environment]::GetFolderPath('Desktop');"
+            "$link = Join-Path $desktop $env:POMO_LINK_NAME;"
+            "$ws = New-Object -ComObject WScript.Shell;"
+            "$sc = $ws.CreateShortcut($link);"
+            "$sc.TargetPath = $env:POMO_TARGET;"
+            "$sc.Arguments = $env:POMO_ARGS;"
+            "$sc.WorkingDirectory = $env:POMO_WORKDIR;"
+            "$sc.IconLocation = $env:POMO_ICON;"
+            "$sc.Save()"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                env=env, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, creationflags=0x08000000)  # 0x08000000 = 不弹控制台黑框
+        except (OSError, subprocess.SubprocessError) as e:
+            messagebox.showerror("创建失败", str(e))
+            return
+        if r.returncode == 0:
+            messagebox.showinfo("成功", f"已在桌面创建快捷方式「{SHORTCUT_NAME}」")
+        else:
+            messagebox.showerror("创建失败", (r.stderr or "").strip() or "PowerShell 执行失败")
 
     def destroy(self):
         self.conn.close()

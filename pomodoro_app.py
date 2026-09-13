@@ -23,6 +23,10 @@ else:
 DB_PATH = os.path.join(BASE_DIR, "pomodoro.db")
 PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
 
+# 图标等随包资源：打包后解压到 sys._MEIPASS，源码运行时就在脚本同级
+RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
+ICON_PATH = os.path.join(RESOURCE_DIR, "record.ico")
+
 STATUSES = ("计划中", "进行中", "已完成", "已归档")
 
 
@@ -672,13 +676,17 @@ class HistoryTab(ttk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("番茄钟记录")
+        self.title("猫猫番茄记录")
         self.geometry("1000x400")
         self.conn = get_conn()
         self.rows = []
         self.saved_snapshot = []  # 上次加载/提交的内容快照，用于脏检测
         self._build_ui()
         self.load_date()
+        # iconbitmap 取窗口句柄时会让窗口提前 realize。放在最后，窗口首次显示就已经是
+        # 最终尺寸且内容就绪；否则会先闪一个 Tk 默认的 200x200 空窗口。
+        if os.path.exists(ICON_PATH):
+            self.iconbitmap(ICON_PATH)
 
     def _build_ui(self):
         self.nb = ttk.Notebook(self)

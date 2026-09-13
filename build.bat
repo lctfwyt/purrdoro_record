@@ -9,7 +9,13 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     exit /b 1
 )
 
-"%~dp0.venv\Scripts\python.exe" -m PyInstaller --onefile --noconsole --name pomodoro_app --clean pomodoro_app.py
+if not exist "%~dp0record.ico" (
+    echo [错误] 未找到图标文件：%~dp0record.ico
+    pause
+    exit /b 1
+)
+
+"%~dp0.venv\Scripts\python.exe" -m PyInstaller --onefile --noconsole --name pomodoro_app --icon "%~dp0record.ico" --add-data "%~dp0record.ico;." --clean pomodoro_app.py
 
 if errorlevel 1 (
     echo.
